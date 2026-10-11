@@ -38,3 +38,7 @@ Jump back to [Usage](#usage).
 `./uninstall.sh` reverts that and restores Ghostwriter as the default.
 
 Requires Python 3 and PyQt5 (`sudo apt install python3-pyqt5 python3-xlib`; python3-xlib lets mdv come to the front when you open a file).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
