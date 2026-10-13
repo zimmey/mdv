@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mdv - a lightweight, read-only, tabbed Markdown viewer."""
+"""mdv - a lightweight, tabbed Markdown viewer and editor."""
 
 import os
 import re
@@ -11,8 +11,9 @@ from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QIcon, 
                          QTextFormat, QTextTable, QTextTableFormat)
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import (QAction, QApplication, QFileDialog, QHBoxLayout, QLabel,
-                             QLineEdit, QMainWindow, QMessageBox, QPushButton, QShortcut,
-                             QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+                             QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+                             QShortcut, QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout,
+                             QWidget)
 
 APP = "mdv"
 SERVER_NAME = f"mdv-{os.getuid()}"
@@ -90,21 +91,29 @@ def img_to_md(m):
     return f"![{attrs.get('alt', '')}]({attrs['src']})" if "src" in attrs else ""
 
 
-class Viewer(QTextBrowser):
-    """One tab: renders a single Markdown file."""
+class Tab(QStackedWidget):
+    """One tab: a file, shown rendered or (Ctrl+M) as editable source."""
 
     def __init__(self, path, window):
         super().__init__()
         self.path = path
         self.window_ = window
-        self.raw = False  # True = "show original": the unrendered source
-        self.text = ""  # file contents as last loaded; rendering always uses this
+        self.text = ""  # file contents as last loaded or saved, i.e. what should be on disk
         self.declined = None  # on-disk version the user chose not to refresh to
-        self.setOpenLinks(False)
-        self.anchorClicked.connect(self.on_link)
-        self.viewport().installEventFilter(self)
-        self.document().setDocumentMargin(28)
+        self.bom = self.crlf = False  # restored on save, so only edited lines change
+        self.view = Viewer(self)
+        self.editor = Editor(self)
+        self.addWidget(self.view)
+        self.addWidget(self.editor)
+        self.editor.document().modificationChanged.connect(lambda: window.update_tab(self))
         self.load()
+
+    @property
+    def editing(self):
+        return self.currentWidget() is self.editor
+
+    def modified(self):
+        return self.editor.document().isModified()
 
     def read_disk(self):
         """Current file contents, or None if it can't be read."""
@@ -115,32 +124,114 @@ class Viewer(QTextBrowser):
             return None
 
     def load(self):
-        """Read the file from disk and render it."""
-        text = self.read_disk()
-        self.text = text if text is not None else f"**Could not read file:** `{self.path}`"
+        """Read the file from disk into the editor and render it."""
+        read_only = False
+        try:
+            with open(self.path, "rb") as f:
+                data = f.read()
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:  # saving would destroy the bytes that aren't UTF-8
+                text, read_only = data.decode("utf-8", errors="replace"), True
+        except OSError:
+            text, read_only = f"**Could not read file:** `{self.path}`", True
+        self.text = text
         self.declined = None
-        self.render()
+        self.bom = text.startswith("\ufeff")
+        self.crlf = "\r\n" in text
+        self.editor.setPlainText((text[1:] if self.bom else text).replace("\r\n", "\n"))
+        self.editor.setReadOnly(read_only)
+        self.view.render(self.source())
 
-    def render(self):
-        """Re-render the loaded text (for zoom / mode changes) without touching disk."""
-        text = self.text
+    def source(self):
+        """The editor's text. toPlainText() would turn non-breaking spaces into plain ones."""
+        return self.editor.document().toRawText().replace("\u2029", "\n")
+
+    def save(self):
+        """Write unsaved edits to disk. Returns False if the file couldn't be written."""
+        if not self.modified():
+            return True
+        disk = self.read_disk()
+        if disk is not None and disk not in (self.text, self.declined):
+            self.window_.ask_reload(self, disk)  # changed behind our back: let the user pick
+            if not self.modified():
+                return True
+        text = self.source()
+        if self.crlf:
+            text = text.replace("\n", "\r\n")
+        if self.bom:
+            text = "\ufeff" + text
+        try:
+            with open(self.path, "wb") as f:  # in place, so permissions and links survive
+                f.write(text.encode("utf-8"))
+        except OSError as e:
+            QMessageBox.warning(self.window_, APP, f"Could not save {self.path}:\n\n{e.strerror}")
+            return False
+        self.text = text  # so the file watcher doesn't offer to refresh to our own write
+        self.declined = None
+        self.editor.document().setModified(False)
+        return True
+
+    def set_editing(self, on):
+        if on == self.editing:
+            return
+        old, new = (self.view, self.editor) if on else (self.editor, self.view)
+        bar = old.verticalScrollBar()
+        frac = bar.value() / bar.maximum() if bar.maximum() else 0.0
+        if not on:
+            self.save()
+            self.view.render(self.source())
+        self.setCurrentWidget(new)
+        # The two views have different heights, so keep the relative position.
+        bar = new.verticalScrollBar()
+        bar.setValue(int(frac * bar.maximum()))
+        new.setFocus()
+        self.window_.update_tab(self)
+
+    def eventFilter(self, obj, event):
+        # Route Ctrl+wheel to the window's shared zoom rather than per-widget zoom.
+        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+            self.window_.zoom(1 if event.angleDelta().y() > 0 else -1)
+            return True
+        return super().eventFilter(obj, event)
+
+
+class Editor(QPlainTextEdit):
+    """A tab's source view: the file as plain, editable text."""
+
+    def __init__(self, tab):
+        super().__init__()
+        self.tab = tab
+        self.viewport().installEventFilter(tab)
+        self.document().setDocumentMargin(28)
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu(event.pos())
+        menu.addSeparator()
+        menu.addAction(self.tab.window_.edit_action)
+        menu.exec_(event.globalPos())
+
+
+class Viewer(QTextBrowser):
+    """A tab's rendered view."""
+
+    def __init__(self, tab):
+        super().__init__()
+        self.tab = tab
+        self.setOpenLinks(False)
+        self.anchorClicked.connect(self.on_link)
+        self.viewport().installEventFilter(tab)
+        self.document().setDocumentMargin(28)
+
+    def render(self, text):
+        """Render Markdown source text, keeping the scroll position."""
         bar = self.verticalScrollBar()
         pos = bar.value()
-        frac = pos / bar.maximum() if bar.maximum() else 0.0
-        mode_changed = getattr(self, "_shown_raw", self.raw) != self.raw
-        self._shown_raw = self.raw
-        folder = os.path.dirname(self.path)
+        folder = os.path.dirname(self.tab.path)
         self.setSearchPaths([folder])
         doc = self.document()
         doc.setBaseUrl(QUrl.fromLocalFile(folder + os.sep))
-        if self.raw:
-            doc.setPlainText(text)
-            fmt = QTextCharFormat()
-            fmt.setFontFamily(QFontDatabase.systemFont(QFontDatabase.FixedFont).family())
-            cursor = QTextCursor(doc)
-            cursor.select(QTextCursor.Document)
-            cursor.mergeCharFormat(fmt)
-        elif self.path.lower().endswith(".txt"):
+        if self.tab.path.lower().endswith(".txt"):
             doc.setPlainText(text)
             self.style_document()
         else:
@@ -151,8 +242,7 @@ class Viewer(QTextBrowser):
             self.style_document()
         # Park the (invisible) cursor at the top, or Qt scrolls to it at the document end.
         self.moveCursor(QTextCursor.Start)
-        # Switching modes changes the document height, so keep the relative position.
-        bar.setValue(int(frac * bar.maximum()) if mode_changed else pos)
+        bar.setValue(pos)
 
     def insert_front_matter(self, meta):
         """Show front matter as a compact key/value table above the document."""
@@ -176,15 +266,10 @@ class Viewer(QTextBrowser):
         cf.setFontPointSize(1)
         top.setBlockCharFormat(cf)
 
-    def set_raw(self, raw):
-        if raw != self.raw:
-            self.raw = raw
-            self.render()
-
     def contextMenuEvent(self, event):
         menu = self.createStandardContextMenu(event.pos())
         menu.addSeparator()
-        menu.addAction(self.window_.show_original_action)
+        menu.addAction(self.tab.window_.edit_action)
         menu.exec_(event.globalPos())
 
     def style_document(self):
@@ -240,11 +325,11 @@ class Viewer(QTextBrowser):
             self.scroll_to_anchor(url.fragment())
             return
         if url.isRelative():
-            url = QUrl.fromLocalFile(os.path.dirname(self.path) + os.sep).resolved(url)
+            url = QUrl.fromLocalFile(os.path.dirname(self.tab.path) + os.sep).resolved(url)
         if url.isLocalFile() and url.toLocalFile().lower().endswith(MD_EXTS):
-            self.window_.open_file(url.toLocalFile())
+            self.tab.window_.open_file(url.toLocalFile())
             if url.fragment():
-                self.window_.current().scroll_to_anchor(url.fragment())
+                self.tab.window_.current().view.scroll_to_anchor(url.fragment())
         else:
             QDesktopServices.openUrl(url)
 
@@ -257,13 +342,6 @@ class Viewer(QTextBrowser):
                 self.verticalScrollBar().setValue(int(top))
                 return
             block = block.next()
-
-    def eventFilter(self, obj, event):
-        # Route Ctrl+wheel to the window's shared zoom rather than per-tab zoom.
-        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
-            self.window_.zoom(1 if event.angleDelta().y() > 0 else -1)
-            return True
-        return super().eventFilter(obj, event)
 
 
 class FindBar(QWidget):
@@ -300,7 +378,7 @@ class FindBar(QWidget):
         self.hide()
         v = self.window_.current()
         if v:
-            v.setFocus()
+            v.currentWidget().setFocus()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
@@ -309,7 +387,7 @@ class FindBar(QWidget):
             super().keyPressEvent(e)
 
     def find(self, backward=False, restart=False):
-        v = self.window_.current()
+        v = self.window_.current() and self.window_.current().currentWidget()
         text = self.edit.text()
         if not v or not text:
             self.status.setText("")
@@ -341,10 +419,12 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.currentChanged.connect(self.update_title)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.last_tab = None
         # Background tabs aren't prompted; check them for changes when they're shown.
         self.tabs.currentChanged.connect(lambda: QTimer.singleShot(0, self.check_current))
         self.asking = False
+        QApplication.instance().applicationStateChanged.connect(self.on_app_state)
 
         self.findbar = FindBar(self)
         central = QWidget()
@@ -383,7 +463,8 @@ class MainWindow(QMainWindow):
         act(m, "&Open…", self.open_dialog, QKeySequence.Open)
         self.recent_menu = m.addMenu("Open &Recent")
         self.recent_menu.aboutToShow.connect(self.fill_recent)
-        act(m, "&Reload", lambda: self.current() and self.current().load(), QKeySequence("F5"))
+        act(m, "&Save", lambda: self.current() and self.current().save(), QKeySequence.Save)
+        act(m, "&Reload", self.reload_current, QKeySequence("F5"))
         act(m, "&Close Tab", lambda: self.close_tab(self.tabs.currentIndex()), QKeySequence("Ctrl+W"))
         m.addSeparator()
         act(m, "&Quit", self.close, QKeySequence("Ctrl+Q"))
@@ -392,8 +473,9 @@ class MainWindow(QMainWindow):
         act(m, "&Find…", self.findbar.open_bar, QKeySequence.Find)
         act(m, "Find &Next", lambda: self.findbar.find(False), QKeySequence("F3"))
         act(m, "Find &Previous", lambda: self.findbar.find(True), QKeySequence("Shift+F3"))
-        self.show_original_action = act(m, "Show &Original", self.toggle_original, QKeySequence("Ctrl+U"))
-        self.show_original_action.setCheckable(True)
+        self.edit_action = act(m, "&Edit Source", self.toggle_editing,
+                               [QKeySequence("Ctrl+M"), QKeySequence("Ctrl+U")])
+        self.edit_action.setCheckable(True)
         m.addSeparator()
         act(m, "Zoom &In", lambda: self.zoom(1), [QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         act(m, "Zoom &Out", lambda: self.zoom(-1), QKeySequence("Ctrl+-"))
@@ -447,18 +529,21 @@ class MainWindow(QMainWindow):
         if not os.path.isfile(path):
             QMessageBox.warning(self, APP, f"File not found:\n{path}")
             return
-        v = Viewer(path, self)
+        v = Tab(path, self)
         self.apply_zoom(v)
         i = self.tabs.addTab(v, os.path.basename(path))
         self.tabs.setTabToolTip(i, path)
         self.tabs.setCurrentIndex(i)
+        self.update_tab(v)
         self.watcher.addPath(path)
         self.add_recent(path)
 
     def close_tab(self, i):
         v = self.tabs.widget(i)
-        if v is None:
+        if v is None or not (v.save() or self.confirm_discard(v, "Close it anyway")):
             return
+        if v is self.last_tab:
+            self.last_tab = None  # saved or discarded above; don't try again on the tab change
         self.tabs.removeTab(i)
         if v.path not in [w.path for w in self.viewers()]:
             self.watcher.removePath(v.path)
@@ -469,18 +554,52 @@ class MainWindow(QMainWindow):
         if n:
             self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % n)
 
-    def toggle_original(self, checked):
+    def on_tab_changed(self):
+        # Auto-save the tab being left.
+        if self.last_tab is not None and self.last_tab is not self.current() and not self.asking:
+            self.last_tab.save()
+        self.last_tab = self.current()
+        self.update_title()
+
+    def toggle_editing(self, checked):
         v = self.current()
         if v:
-            v.set_raw(checked)
-            i = self.tabs.indexOf(v)
-            name = os.path.basename(v.path)
-            self.tabs.setTabText(i, f"{name} (original)" if checked else name)
+            v.set_editing(checked)
+
+    def update_tab(self, v):
+        """Show v's mode and unsaved state in its tab label (and the title, if current)."""
+        i = self.tabs.indexOf(v)
+        if i < 0:
+            return
+        label = ("• " if v.modified() else "") + os.path.basename(v.path)
+        if v.editing:
+            label += " (read-only)" if v.editor.isReadOnly() else " (source)"
+        self.tabs.setTabText(i, label)
+        if v is self.current():
+            self.update_title()
 
     def update_title(self):
         v = self.current()
-        self.show_original_action.setChecked(bool(v and v.raw))
-        self.setWindowTitle(f"{os.path.basename(v.path)} — {APP}" if v else APP)
+        self.edit_action.setChecked(bool(v and v.editing))
+        self.setWindowTitle(f"{'*' if v.modified() else ''}{os.path.basename(v.path)} — {APP}"
+                            if v else APP)
+
+    def confirm_discard(self, v, question):
+        """Ask whether to throw away v's unsaved edits (after a failed save, say)."""
+        return QMessageBox.warning(
+            self, APP, f"{os.path.basename(v.path)} has unsaved edits.\n\n{question} and discard them?",
+            QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel) == QMessageBox.Discard
+
+    def reload_current(self):
+        v = self.current()
+        if v and (not v.modified() or self.confirm_discard(v, "Reload it from disk")):
+            v.load()
+
+    def on_app_state(self, state):
+        # Auto-save when mdv loses focus (unless that's to one of our own dialogs).
+        if state != Qt.ApplicationActive and not self.asking:
+            for v in self.viewers():
+                v.save()
 
     # ---- auto-reload -------------------------------------------------------
     def on_file_changed(self, path):
@@ -509,15 +628,31 @@ class MainWindow(QMainWindow):
         disk = v.read_disk()
         if disk is None or disk in (v.text, v.declined):
             return
+        self.ask_reload(v, disk)
+        # The file may have changed again (or the tab switched) while the dialog was up.
+        QTimer.singleShot(0, self.check_current)
+
+    def ask_reload(self, v, disk):
+        """v's file on disk (now `disk`) differs from what v has; offer to reload it."""
         self.asking = True
         try:
-            box = QMessageBox(QMessageBox.Question, APP,
-                              f"{os.path.basename(v.path)} has changed on disk.\n\n"
-                              "Refresh to show the new version?", parent=self)
+            name = os.path.basename(v.path)
+            if v.modified():
+                box = QMessageBox(QMessageBox.Warning, APP,
+                                  f"{name} has changed on disk, and you have unsaved edits.\n\n"
+                                  "Reload it and discard your edits, or keep your version? "
+                                  "Keeping yours overwrites the file on disk when it's saved.",
+                                  parent=self)
+                refresh = box.addButton("Reload", QMessageBox.DestructiveRole)
+                box.setDefaultButton(box.addButton("Keep Mine", QMessageBox.RejectRole))
+            else:
+                box = QMessageBox(QMessageBox.Question, APP,
+                                  f"{name} has changed on disk.\n\n"
+                                  "Refresh to show the new version?", parent=self)
+                refresh = box.addButton("Refresh", QMessageBox.AcceptRole)
+                box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(refresh)
             box.setInformativeText(v.path)
-            refresh = box.addButton("Refresh", QMessageBox.AcceptRole)
-            box.addButton(QMessageBox.Cancel)
-            box.setDefaultButton(refresh)
             box.exec_()
             if box.clickedButton() is refresh:
                 v.load()
@@ -525,8 +660,6 @@ class MainWindow(QMainWindow):
                 v.declined = disk
         finally:
             self.asking = False
-        # The file may have changed again (or the tab switched) while the dialog was up.
-        QTimer.singleShot(0, self.check_current)
 
     # ---- zoom --------------------------------------------------------------
     def zoom(self, step):
@@ -536,11 +669,16 @@ class MainWindow(QMainWindow):
             self.apply_zoom(v)
 
     def apply_zoom(self, v):
-        f = v.font()
-        f.setPointSizeF(self.base_pt * ZOOM_STEP ** self.zoom_level)
-        v.setFont(f)
-        v.document().setDefaultFont(f)
-        v.render()  # re-render so headings/code scale with the base font
+        size = self.base_pt * ZOOM_STEP ** self.zoom_level
+        f = v.view.font()
+        f.setPointSizeF(size)
+        v.view.setFont(f)
+        v.view.document().setDefaultFont(f)
+        v.view.render(v.source())  # re-render so headings/code scale with the base font
+        f = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        f.setPointSizeF(size)
+        v.editor.setFont(f)
+        v.editor.setTabStopDistance(4 * v.editor.fontMetrics().horizontalAdvance(" "))
 
     # ---- drag & drop / lifecycle ------------------------------------------
     def dragEnterEvent(self, e):
@@ -553,6 +691,11 @@ class MainWindow(QMainWindow):
                 self.open_file(url.toLocalFile())
 
     def closeEvent(self, e):
+        for v in self.viewers():
+            if not (v.save() or self.confirm_discard(v, "Quit anyway")):
+                self.tabs.setCurrentWidget(v)
+                e.ignore()
+                return
         self.settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(e)
 
