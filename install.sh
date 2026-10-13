@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install mdv for the current user and make it the default Markdown viewer.
+# Install mdv for the current user and make it the default app for Markdown files.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 
@@ -14,13 +14,13 @@ cat > ~/.local/share/applications/mdv.desktop <<EOF
 [Desktop Entry]
 Type=Application
 Name=mdv
-GenericName=Markdown Viewer
-Comment=Lightweight read-only Markdown viewer
+GenericName=Markdown Editor
+Comment=Lightweight tabbed Markdown viewer and editor
 Exec=$HOME/.local/bin/mdv %F
 Icon=mdv
 StartupWMClass=mdv
 Terminal=false
-Categories=Utility;TextTools;Viewer;
+Categories=Utility;TextTools;TextEditor;Viewer;
 MimeType=text/markdown;text/x-markdown;
 EOF
 
