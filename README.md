@@ -7,6 +7,8 @@ press Ctrl+M to edit the source.
 
 ```bash
 mdv file1.md file2.md      # open files (adds tabs if mdv is already running)
+mdv -n file3.md            # open a file in a separate window instead
+mdv                        # open a new, empty window
 ```
 
 Or double-click a `.md` file after running `./install.sh`.
@@ -15,6 +17,7 @@ Or double-click a `.md` file after running `./install.sh`.
 
 | Key                         | Action                 |
 |-----------------------------|------------------------|
+| Ctrl+Shift+N                | New window             |
 | Ctrl+O                      | Open file(s)           |
 | Ctrl+S                      | Save                   |
 | Ctrl+W                      | Close tab              |
@@ -27,7 +30,7 @@ Or double-click a `.md` file after running `./install.sh`.
 
 ## Features
 
-- [x] Tabs, drag and drop, recent files
+- [x] Tabs, drag and drop, recent files, multiple windows (File → New Window, Ctrl+click or middle-click the taskbar entry, or `mdv -n`)
 - [x] Edit the source and toggle back to see it rendered. Edits are saved automatically when you
       switch back to rendered, switch tabs, close a tab, quit, or switch to another app.
       Line endings, BOMs and non-breaking spaces are kept; files that aren't valid UTF-8 open read-only.

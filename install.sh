@@ -22,6 +22,11 @@ StartupWMClass=mdv
 Terminal=false
 Categories=Utility;TextTools;TextEditor;Viewer;
 MimeType=text/markdown;text/x-markdown;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=$HOME/.local/bin/mdv --new-window
 EOF
 
 update-desktop-database ~/.local/share/applications 2>/dev/null || true

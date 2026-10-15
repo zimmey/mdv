@@ -3,9 +3,10 @@
 
 import os
 import re
+import subprocess
 import sys
 
-from PyQt5.QtCore import QEvent, QFileSystemWatcher, QSettings, Qt, QTimer, QUrl
+from PyQt5.QtCore import QEvent, QFileSystemWatcher, QPoint, QSettings, Qt, QTimer, QUrl
 from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence, QPalette,
                          QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument,
                          QTextFormat, QTextTable, QTextTableFormat)
@@ -21,6 +22,12 @@ MAX_RECENT = 10
 ZOOM_STEP = 1.1
 SPACER = QTextFormat.UserProperty + 1  # marks the collapsed block above front matter
 MD_EXTS = (".md", ".markdown", ".mdown", ".mkd", ".txt")
+USAGE = """usage: mdv [-n | --new-window] [FILE ...]
+
+Opens FILEs as tabs in the running mdv window, or starts one.
+Run without files, it opens a new window.
+  -n, --new-window   open FILEs in a separate window instead of adding tabs
+  -h, --help         show this help"""
 
 
 def slugify(text):
@@ -408,7 +415,7 @@ class FindBar(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, offset=False):
         super().__init__()
         self.settings = QSettings(APP, APP)
         self.zoom_level = int(self.settings.value("zoom", 0))
@@ -447,6 +454,8 @@ class MainWindow(QMainWindow):
         geom = self.settings.value("geometry")
         if geom:
             self.restoreGeometry(geom)
+        if offset:  # a second window shouldn't sit exactly on top of the first
+            self.move(self.pos() + QPoint(40, 40))
         self.update_title()
 
     # ---- menus -------------------------------------------------------------
@@ -460,6 +469,7 @@ class MainWindow(QMainWindow):
             return a
 
         m = self.menuBar().addMenu("&File")
+        act(m, "New &Window", new_window, QKeySequence("Ctrl+Shift+N"))
         act(m, "&Open…", self.open_dialog, QKeySequence.Open)
         self.recent_menu = m.addMenu("Open &Recent")
         self.recent_menu.aboutToShow.connect(self.fill_recent)
@@ -731,16 +741,27 @@ def x11_activate(wid):
         d.close()
 
 
-# ---- single instance -------------------------------------------------------
-def send_to_running(paths):
+# ---- instances -------------------------------------------------------------
+# The first instance listens on a local socket; files opened later (e.g. by
+# double-clicking) are handed to it so they become tabs.  Launching mdv with no
+# files (e.g. Ctrl+click on its taskbar entry) or with --new-window starts a
+# further, independent instance that leaves the socket alone.
+def new_window():
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "--new-window"],
+                     close_fds=True, start_new_session=True)
+
+
+def connect_running():
+    """Return a socket connected to the running instance, or None."""
     sock = QLocalSocket()
     sock.connectToServer(SERVER_NAME)
-    if not sock.waitForConnected(300):
-        return False
+    return sock if sock.waitForConnected(300) else None
+
+
+def send_to_running(sock, paths):
     sock.write(("\n".join(paths) + "\n").encode())
     sock.waitForBytesWritten(1000)
     sock.disconnectFromServer()
-    return True
 
 
 def start_server(window):
@@ -779,11 +800,21 @@ def main():
     if pal.color(QPalette.Base).lightness() < 128 and pal.color(QPalette.Link).lightness() < 128:
         pal.setColor(QPalette.Link, QColor("#6cb6ff"))  # default blue is unreadable on dark themes
         app.setPalette(pal)
-    paths = [os.path.abspath(p) for p in sys.argv[1:] if not p.startswith("-")]
-    if send_to_running(paths):
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(USAGE)
         return 0
-    win = MainWindow()
-    win._server = start_server(win)
+    paths = [os.path.abspath(a) for a in args if not a.startswith("-")]
+    separate = "-n" in args or "--new-window" in args or not paths
+    sock = connect_running()
+    if sock and not separate:
+        send_to_running(sock, paths)
+        return 0
+    win = MainWindow(offset=separate)
+    if sock:
+        sock.disconnectFromServer()  # the first instance keeps receiving opened files
+    else:
+        win._server = start_server(win)
     for p in paths:
         win.open_file(p)
     win.show()
